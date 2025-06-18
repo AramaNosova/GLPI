@@ -1,5 +1,9 @@
 import os
 import requests
+import asyncio
+from datetime import datetime
+from typing import Dict, Tuple, Optional
+import difflib
 from aiogram import F, types, Router, Bot,Dispatcher
 from aiogram.enums import ParseMode
 from aiogram.filters import CommandStart, Command, or_f
@@ -37,7 +41,13 @@ class AuthForm(StatesGroup):
     PASSWORD = State()
     SESSION_TOKEN = State()
 
-# ... (предыдущий импорт остается без изменений)
+# Глобальное хранилище последних состояний заявок
+last_ticket_states: Dict[int, int] = {}
+
+async def on_startup(bot: Bot):
+    """Запускается при старте бота"""
+    asyncio.create_task(check_ticket_updates(bot))
+
 
 from typing import List, Dict, Tuple
 import numpy as np
@@ -144,6 +154,7 @@ def create_glpi_ticket(session_token: str, ticket_data: dict, telegram_id: int) 
         return False
 
 # ... (остальной код остается без изменений)
+
 
 # Обработчик команды авторизации
 @user_private_router.message(Command("start"))
@@ -341,12 +352,17 @@ def get_user_tickets(session_data: dict, telegram_id: int) -> list:
     # Для администраторов и техников показываем все заявки
     if profile in ('Admin', 'Super-Admin', 'Technician'):
         return all_tickets
-    # Для обычных пользователей — только их заявки
+     # Для обычных пользователей — только их заявки
     else:
-        return [
-            ticket for ticket in all_tickets 
-            if f"Telegram (ID: {telegram_id})" in ticket.get('content', '')
-        ]
+        user_tickets = []
+        for ticket in all_tickets:
+            # Проверяем по ID в содержимом
+            if f"Telegram (ID: {telegram_id})" in ticket.get('content', ''):
+                user_tickets.append(ticket)
+            # Или проверяем по автору заявки (если API возвращает эту информацию)
+            elif ticket.get('users_id_recipient') == session_data.get('user_id'):
+                user_tickets.append(ticket)
+        return user_tickets
 
 # Просмотр заявок
 @user_private_router.message(F.text.lower() == "мои заявки")
@@ -363,7 +379,6 @@ async def cmd_my_tickets(message: Message):
         if not tickets:
             await message.answer("🚫 Нет доступных заявок")
             return
-            
         response = "📋 Ваши последние заявки:\n\n" + \
                   "\n".join([format_ticket(t) for t in tickets[:10]])
         
@@ -389,7 +404,7 @@ def format_ticket(ticket):
         "\nОписание проблемы:"
     )
     
-    short_content = (content[:200] + '...') if len(content) > 200 else content
+    short_content = (formatted_content[:200] + '...') if len(formatted_content) > 200 else formatted_content
     
     return (
         f"🔹 #{ticket.get('id', 'N/A')}\n"
@@ -397,7 +412,7 @@ def format_ticket(ticket):
         f"📝 Описание: {short_content}\n"
         f"🔄 Статус: {get_status_name(ticket.get('status', 0))}\n"
         f"📅 Дата создания: {ticket.get('date', 'N/A')}\n"
-        f"⚠️ Приоритет: {get_priority_name(ticket.get('priority', 0))}\n"
+        f"⚠️ Срочность: {get_urgency_name(ticket.get('urgency', 0))}\n"
         f"🔔 Тип: {get_type_name(ticket.get('type', 0))}\n"
         f"────────────────────"
     )
@@ -406,23 +421,33 @@ def get_status_name(status_id):
     """Преобразует ID статуса в читаемое название"""
     status_mapping = {
         1: "🆕 Новая",
-        2: "🔄 В обработке", 
-        3: "✅ Решена",
-        4: "☑️ Проверена",
-        5: "❌ Закрыта",
-        6: "⏳ Ожидание"
+        2: "🔄 В работе(назначена)", 
+        3: "☑️ В работе(запланирована)",
+        4: "⏳ В ожидании",
+        5: "✅ Решена",
+        6: "❌ Закрыта"  
     }
     return status_mapping.get(status_id, f"❓ Неизвестный статус ({status_id})")
 
-def get_priority_name(priority_id):
-    priority_mapping = {
+def get_urgency_name(urgency_id):
+    urgency_mapping = {
         1: "🟢 Очень ниизкая",
         2: "🟡 Низкая",
-        3: "🔴 Средняя",
+        3: "🟠 Средняя",
         4: "🚨 Высокая",
         5: "⚡ Очень высокая"
     }
-    return priority_mapping.get(priority_id, f"❓ Неизвестный приоритет ({priority_id})")
+    return urgency_mapping.get(urgency_id, f"❓ Неизвестная срочность ({urgency_id})")
+
+def get_impact_name(impact_id):
+    impact_mapping = {
+        1: "🟢 Очень ниизкое",
+        2: "🟡 Низкое",
+        3: "🟠 Среднее",
+        4: "🚨 Высокое",
+        5: "⚡ Очень высокое"
+    }
+    return impact_mapping.get(impact_id, f"❓ Неизвестное влияение ({impact_id})")
 
 def get_type_name(type_id):
     type_mapping = {
@@ -446,3 +471,181 @@ def clean_html_content(text):
     text = ' '.join(text.split())
     
     return text
+
+
+# Функция для получения информации о конкретной заявке
+def get_ticket_details(session_token: str, ticket_id: int) -> dict:
+    """Получает детали заявки по ID"""
+    url = f"{GLPI_URL}/Ticket/{ticket_id}"
+    headers = {
+        "Content-Type": "application/json",
+        "App-Token": GLPI_API_KEY,
+        "Session-Token": session_token
+    }
+    
+    try:
+        response = requests.get(url, headers=headers)
+        if response.status_code == 200:
+            return response.json()
+        return None
+    except Exception as e:
+        print(f"Ошибка получения заявки {ticket_id}: {str(e)}")
+        return None
+
+# Функция для поиска Telegram ID инициатора заявки
+def find_telegram_id_in_content(content: str) -> int:
+    """Ищет Telegram ID в содержимом заявки"""
+    if not content:
+        return None
+    
+    match = re.search(r"Telegram \(ID: (\d+)\)", content)
+    return int(match.group(1)) if match else None
+
+
+# Какие поля отслеживаем для изменений
+TRACKED_FIELDS = {
+    'status': ('🔄 Статус', get_status_name),
+    'urgency': ('⚠️ Срочность', get_urgency_name),
+    'impact': ('📍 Влияние', get_impact_name),
+    'type': ('🔔 Тип', get_type_name),
+    'name': ('📌 Тема', str),
+    'content': ('📝 Описание', lambda x: x[:100] + '...' if len(x) > 100 else x),
+    'time_to_resolve': ('⏳ Срок решения', str),
+}
+
+async def check_ticket_updates(bot: Bot):
+    """Периодически проверяет изменения заявок и отправляет уведомления"""
+    while True:
+        try:
+            # Для каждого авторизованного пользователя проверяем его заявки
+            for telegram_id, session_data in user_sessions.items():
+                session_token = session_data.get('session_token')
+                if not session_token:
+                    continue
+                
+                tickets = get_user_tickets(session_data, telegram_id)
+                if not tickets:
+                    continue
+                
+                for ticket in tickets:
+                    ticket_id = ticket.get('id')
+                    current_data = {
+                        'id': ticket_id,
+                        'name': ticket.get('name'),
+                        'content': clean_html_content(ticket.get('content', '')),
+                        'status': ticket.get('status'),
+                        'urgency': ticket.get('urgency'),
+                        'impact': ticket.get('impact'),
+                        'type': ticket.get('type'),
+                        'time_to_resolve': ticket.get('time_to_resolve'),
+                    }
+                    
+                    # Если заявка новая, сохраняем ее состояние
+                    if ticket_id not in last_ticket_states:
+                        last_ticket_states[ticket_id] = current_data
+                        continue
+                    
+                    # Получаем предыдущее состояние
+                    previous_data = last_ticket_states[ticket_id]
+                    
+                    # Проверяем изменения по всем отслеживаемым полям
+                    changes = detect_ticket_changes(previous_data, current_data)
+                    
+                    if changes:
+                        # Получаем полные данные заявки
+                        ticket_details = get_ticket_details(session_token, ticket_id)
+                        if not ticket_details:
+                            continue
+                        
+                        # Ищем Telegram ID инициатора
+                        initiator_id = find_telegram_id_in_content(ticket_details.get('content', ''))
+                        if not initiator_id:
+                            continue
+                        
+                        # Формируем и отправляем уведомление об изменениях
+                        await send_ticket_update_notification(
+                            bot, 
+                            ticket_id, 
+                            previous_data, 
+                            current_data, 
+                            changes, 
+                            initiator_id
+                        )
+                        
+                        # Обновляем последнее известное состояние
+                        last_ticket_states[ticket_id] = current_data
+            
+            await asyncio.sleep(10)  # Пауза между проверками
+            
+        except Exception as e:
+            print(f"Ошибка в check_ticket_updates: {str(e)}")
+            await asyncio.sleep(10)
+
+def detect_ticket_changes(previous: dict, current: dict) -> Dict[str, Tuple]:
+    """Обнаруживает изменения между состояниями заявки"""
+    changes = {}
+    
+    for field, (field_name, formatter) in TRACKED_FIELDS.items():
+        prev_value = previous.get(field)
+        curr_value = current.get(field)
+        
+        if prev_value != curr_value:
+            changes[field] = (
+                field_name,
+                formatter(prev_value) if prev_value is not None else "Не указано",
+                formatter(curr_value) if curr_value is not None else "Не указано"
+            )
+    
+    return changes
+
+async def send_ticket_update_notification(
+    bot: Bot, 
+    ticket_id: int, 
+    previous_data: dict, 
+    current_data: dict, 
+    changes: Dict[str, Tuple], 
+    user_id: int
+):
+    """Отправляет уведомление об изменениях в заявке"""
+    message_lines = [
+        f"📢 Изменения в заявке #{ticket_id}",
+        f"📌 Тема: {current_data.get('name', 'Без названия')}",
+        "",
+        "Измененные параметры:"
+    ]
+    
+    for field, (field_name, prev_val, curr_val) in changes.items():
+        message_lines.append(f"▫️ {field_name}:")
+        message_lines.append(f"    Было: {prev_val}")
+        message_lines.append(f"    Стало: {curr_val}")
+        message_lines.append("")
+    
+    message_lines.extend([
+        f"📅 Последнее изменение: {datetime.now().strftime('%Y-%m-%d %H:%M')}"
+    ])
+    
+    try:
+        await bot.send_message(
+            user_id,
+            "\n".join(message_lines),
+            disable_web_page_preview=True
+        )
+    except Exception as e:
+        print(f"Ошибка отправки уведомления пользователю {user_id}: {str(e)}")
+
+def get_ticket_details(session_token: str, ticket_id: int) -> Optional[dict]:
+    """Получает полные детали заявки"""
+    url = f"{GLPI_URL}/Ticket/{ticket_id}"
+    headers = {
+        "Content-Type": "application/json",
+        "App-Token": GLPI_API_KEY,
+        "Session-Token": session_token
+    }
+    
+    try:
+        response = requests.get(url, headers=headers)
+        if response.status_code == 200:
+            return response.json()
+    except Exception as e:
+        print(f"Ошибка получения деталей заявки {ticket_id}: {str(e)}")
+    return None
