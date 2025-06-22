@@ -190,6 +190,10 @@ async def process_password(message: Message, state: FSMContext):
     else:
         await message.answer("❌ Ошибка авторизации. Проверьте логин и пароль")
     
+    try:
+        await message.delete()
+    except Exception as e:
+        print(f"Не удалось удалить сообщение с паролем: {str(e)}")
     await state.clear()
 
 def init_session_with_auth(login: str, password: str) -> dict:
