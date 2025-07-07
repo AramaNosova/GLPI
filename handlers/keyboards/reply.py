@@ -14,6 +14,15 @@ start_kb = ReplyKeyboardMarkup(
     resize_keyboard=True,
 )
 
+cancel = ReplyKeyboardMarkup( 
+    keyboard=[
+        [
+            KeyboardButton(text="Отменить заявку ❌")
+        ]
+    ],
+    resize_keyboard=True,
+)
+
 type = ReplyKeyboardMarkup(
     keyboard=[
         [
@@ -22,9 +31,13 @@ type = ReplyKeyboardMarkup(
         [
             KeyboardButton(text="Запрос"),
         ],
+        [
+            KeyboardButton(text="Отменить заявку ❌")
+        ]
     ],
     resize_keyboard=True,
 )
+
 
 urgency = ReplyKeyboardMarkup(
     keyboard=[
@@ -43,6 +56,9 @@ urgency = ReplyKeyboardMarkup(
          [
             KeyboardButton(text="5 - Очень высокая"),
         ],
+        [
+            KeyboardButton(text="Отменить заявку ❌")
+        ]
     ],
     resize_keyboard=True,
 )

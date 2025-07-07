@@ -189,11 +189,11 @@ async def process_password(message: Message, state: FSMContext):
         await message.answer("Выберите действие", reply_markup=reply.start_kb)
     else:
         await message.answer("❌ Ошибка авторизации. Проверьте логин и пароль")
-    
     try:
         await message.delete()
     except Exception as e:
         print(f"Не удалось удалить сообщение с паролем: {str(e)}")
+
     await state.clear()
 
 def init_session_with_auth(login: str, password: str) -> dict:
@@ -241,6 +241,8 @@ def get_glpi_user_profile(session_token: str) -> str:
         response = requests.get(url, headers=headers)
         if response.status_code == 200:
             profile_name = response.json().get('session', {}).get('glpiactiveprofile', {}).get('name', 'Normal')
+            print(f"Профиль пользователя: {profile_name}")
+            
             return profile_name
         return "Normal"
     except Exception as e:
@@ -261,7 +263,7 @@ def get_glpi_tickets(session_token):
 
      # Параметры для фильтрации (можно настроить под свои нужды)
     params = {
-        'range': '0-10',  # Получаем первые 10 заявок
+        # 'range': '0-10',  # Получаем первые 10 заявок
         'order': 'DESC',  # Сортировка по убыванию (новые сначала)
         'sort': 'id',     # Сортировка по ID (правильное имя поля)
     }
@@ -276,19 +278,32 @@ def get_glpi_tickets(session_token):
     except Exception as e:
         print(f"Ошибка подключения: {str(e)}")
         return None
+    
+#отмена процесса создания заявки
+@user_private_router.message(F.text.lower() == "отменить заявку ❌")
+async def cmd_cancel(message: Message, state: FSMContext):
+    await state.clear()
+    await message.answer(
+        text="Действие отменено",
+        reply_markup=reply.start_kb
+    )
+    await message.answer(
+        text="Выберите действие"
+    )
+
 
 # Создание новой заявки
 @user_private_router.message(F.text.lower() == "создать заявку")
 async def cmd_create_ticket(message: Message, state: FSMContext):
     await state.set_state(NewTicketForm.TITLE)
-    await message.answer("Введите название заявки:")
+    await message.answer("Введите название заявки:", reply_markup=reply.cancel)
 
 # Шаг 1: Получение названия
 @user_private_router.message(NewTicketForm.TITLE)
 async def process_title(message: Message, state: FSMContext):
     await state.update_data(title=message.text)
     await state.set_state(NewTicketForm.DESCRIPTION)
-    await message.answer("Опишите проблему подробно:")
+    await message.answer("Опишите проблему подробно:", reply_markup=reply.cancel)
 
 # Шаг 2: Получение описания
 @user_private_router.message(NewTicketForm.DESCRIPTION)
@@ -342,31 +357,70 @@ async def process_type(message: Message, state: FSMContext):
         await message.answer("Пожалуйста, выберите тип из предложенных вариантов")
 
 def get_user_tickets(session_data: dict, telegram_id: int) -> list:
-    """Получает заявки в зависимости от роли пользователя в GLPI"""
+    """Получает заявки пользователя с проверкой:
+    1. Если есть Telegram ID в заявке - проверяем совпадение и по Telegram ID и по GLPI ID
+    2. Если нет Telegram ID в заявке - проверяем только по GLPI ID
+    3. Для админов показывает все заявки"""
     if not session_data:
         return None
     
     session_token = session_data.get('session_token')
     profile = session_data.get('profile', 'Normal')
     
+    # Для администраторов и техников показываем все заявки
+    if profile in ('Admin', 'Super-Admin', 'Technician' ):
+        return get_glpi_tickets(session_token)
+    
+    # Для обычных пользователей — строгая проверка
+    glpi_user_id = get_glpi_user_id(session_token)
+    if not glpi_user_id:
+        return None
+        
     all_tickets = get_glpi_tickets(session_token)
     if not all_tickets:
         return None
     
-    # Для администраторов и техников показываем все заявки
-    if profile in ('Admin', 'Super-Admin', 'Technician'):
-        return all_tickets
-     # Для обычных пользователей — только их заявки
-    else:
-        user_tickets = []
-        for ticket in all_tickets:
-            # Проверяем по ID в содержимом
-            if f"Telegram (ID: {telegram_id})" in ticket.get('content', ''):
-                user_tickets.append(ticket)
-            # Или проверяем по автору заявки (если API возвращает эту информацию)
-            elif ticket.get('users_id_recipient') == session_data.get('user_id'):
-                user_tickets.append(ticket)
-        return user_tickets
+    user_tickets = []
+    for ticket in all_tickets:
+        # Заявка должна принадлежать текущему пользователю по GLPI ID
+        if ticket.get('users_id_recipient') != glpi_user_id:
+            continue
+            
+        ticket_content = ticket.get('content', '')
+        telegram_id_in_ticket = None
+        
+        # Пытаемся извлечь Telegram ID из заявки
+        match = re.search(r"Telegram \(ID: (\d+)\)", ticket_content)
+        if match:
+            telegram_id_in_ticket = int(match.group(1))
+        
+        # Если в заявке есть Telegram ID - он должен совпадать с текущим пользователем
+        if telegram_id_in_ticket is not None and telegram_id_in_ticket != telegram_id:
+            continue
+            
+        # Если дошли сюда - заявка проходит все проверки
+        user_tickets.append(ticket)
+    
+    return user_tickets
+
+def get_glpi_user_id(session_token: str) -> Optional[int]:
+    """Получает ID текущего пользователя в GLPI"""
+    url = f"{GLPI_URL}/getFullSession/"
+    headers = {
+        "Content-Type": "application/json",
+        "App-Token": GLPI_API_KEY,
+        "Session-Token": session_token
+    }
+    
+    try:
+        response = requests.get(url, headers=headers)
+        if response.status_code == 200:
+            return response.json().get('session', {}).get('glpiID')
+        return None
+    except Exception as e:
+        print(f"Ошибка получения ID пользователя GLPI: {str(e)}")
+        return None
+
 
 # Просмотр заявок
 @user_private_router.message(F.text.lower() == "мои заявки")
@@ -380,6 +434,7 @@ async def cmd_my_tickets(message: Message):
     
     try:
         tickets = get_user_tickets(session_data, message.from_user.id)
+        print("заявка: ", tickets)
         if not tickets:
             await message.answer("🚫 Нет доступных заявок")
             return
@@ -435,7 +490,7 @@ def get_status_name(status_id):
 
 def get_urgency_name(urgency_id):
     urgency_mapping = {
-        1: "🟢 Очень ниизкая",
+        1: "🟢 Очень низкая",
         2: "🟡 Низкая",
         3: "🟠 Средняя",
         4: "🚨 Высокая",
@@ -445,7 +500,7 @@ def get_urgency_name(urgency_id):
 
 def get_impact_name(impact_id):
     impact_mapping = {
-        1: "🟢 Очень ниизкое",
+        1: "🟢 Очень низкое",
         2: "🟡 Низкое",
         3: "🟠 Среднее",
         4: "🚨 Высокое",
@@ -515,7 +570,43 @@ TRACKED_FIELDS = {
     'name': ('📌 Тема', str),
     'content': ('📝 Описание', lambda x: x[:100] + '...' if len(x) > 100 else x),
     'time_to_resolve': ('⏳ Срок решения', str),
+    'comments': ('💬 Комментарии', lambda x: f"{len(x)} комментариев"),
 }
+
+def get_ticket_comments(session_token: str, ticket_id: int) -> list:
+    """Получает комментарии к заявке"""
+    url = f"{GLPI_URL}/Ticket/{ticket_id}/ITILFollowup"
+    headers = {
+        "Content-Type": "application/json",
+        "App-Token": GLPI_API_KEY,
+        "Session-Token": session_token
+    }
+    
+    try:
+        response = requests.get(url, headers=headers)
+        if response.status_code == 200:
+            comments_json = response.json()
+            import json
+            # print(f"Комментарии для заявки {ticket_id}:")
+            # print(json.dumps(comments_json, indent=4, ensure_ascii=False))
+            return comments_json
+        else:
+            # print(f"Ошибка получения комментариев для заявки {ticket_id}: {response.status_code} {response.text}")
+            return []
+    except Exception as e:
+        print(f"Ошибка получения комментариев для заявки {ticket_id}: {str(e)}")
+        return []
+    
+    
+def get_new_comments(previous_comments: list, current_comments: list) -> list:
+    """Находит новые комментарии"""
+    if not previous_comments:
+        return current_comments
+    
+    previous_ids = {c['id'] for c in previous_comments}
+    return [c for c in current_comments if c['id'] not in previous_ids]
+
+
 
 async def check_ticket_updates(bot: Bot):
     """Периодически проверяет изменения заявок и отправляет уведомления"""
@@ -533,6 +624,8 @@ async def check_ticket_updates(bot: Bot):
                 
                 for ticket in tickets:
                     ticket_id = ticket.get('id')
+                    current_comments = get_ticket_comments(session_token, ticket_id)
+                    
                     current_data = {
                         'id': ticket_id,
                         'name': ticket.get('name'),
@@ -542,6 +635,7 @@ async def check_ticket_updates(bot: Bot):
                         'impact': ticket.get('impact'),
                         'type': ticket.get('type'),
                         'time_to_resolve': ticket.get('time_to_resolve'),
+                        'comments': current_comments,
                     }
                     
                     # Если заявка новая, сохраняем ее состояние
@@ -555,18 +649,36 @@ async def check_ticket_updates(bot: Bot):
                     # Проверяем изменения по всем отслеживаемым полям
                     changes = detect_ticket_changes(previous_data, current_data)
                     
-                    if changes:
-                        # Получаем полные данные заявки
-                        ticket_details = get_ticket_details(session_token, ticket_id)
-                        if not ticket_details:
-                            continue
-                        
-                        # Ищем Telegram ID инициатора
-                        initiator_id = find_telegram_id_in_content(ticket_details.get('content', ''))
-                        if not initiator_id:
-                            continue
-                        
-                        # Формируем и отправляем уведомление об изменениях
+
+                     # Проверяем новые комментарии
+                    new_comments = get_new_comments(
+                        previous_data.get('comments', []),
+                        current_data.get('comments', [])
+                    )
+                    
+
+         # Получаем полные данные заявки
+                    ticket_details = get_ticket_details(session_token, ticket_id)
+                    if not ticket_details:
+                        continue
+                    
+                    # Ищем Telegram ID инициатора
+                    initiator_id = find_telegram_id_in_content(ticket_details.get('content', ''))
+                    if not initiator_id:
+                        continue
+                    
+                    # Если есть только новые комментарии - отправляем только уведомление о них
+                    if new_comments and not changes:
+                        await send_comment_notification(
+                            bot,
+                            ticket_id,
+                            current_data.get('name', 'Без названия'),
+                            new_comments,
+                            initiator_id,
+                            session_token  # Добавляем session_token для получения имен пользователей
+                        )
+                    # Если есть изменения (но нет новых комментариев) - отправляем уведомление об изменениях
+                    elif changes and not new_comments:
                         await send_ticket_update_notification(
                             bot, 
                             ticket_id, 
@@ -575,9 +687,20 @@ async def check_ticket_updates(bot: Bot):
                             changes, 
                             initiator_id
                         )
-                        
-                        # Обновляем последнее известное состояние
-                        last_ticket_states[ticket_id] = current_data
+                    # Если есть и то и другое - отправляем комбинированное уведомление
+                    elif changes and new_comments:
+                        await send_combined_notification(
+                            bot,
+                            ticket_id,
+                            current_data.get('name', 'Без названия'),
+                            changes,
+                            new_comments,
+                            initiator_id,
+                            session_token
+                        )
+                    
+                    # Обновляем последнее известное состояние
+                    last_ticket_states[ticket_id] = current_data
             
             await asyncio.sleep(10)  # Пауза между проверками
             
@@ -585,11 +708,145 @@ async def check_ticket_updates(bot: Bot):
             print(f"Ошибка в check_ticket_updates: {str(e)}")
             await asyncio.sleep(10)
 
+async def send_comment_notification(
+    bot: Bot,
+    ticket_id: int,
+    ticket_name: str,
+    comments: list,
+    user_id: int,
+    session_token: str  # Добавлен параметр для получения имен пользователей
+):
+    """Отправляет уведомление о новых комментариях"""
+    message_lines = [
+        f"💬 Новые комментарии к заявке #{ticket_id}",
+        f"📌 Тема: {ticket_name}",
+        "",
+        "Последние комментарии:"
+    ]
+    
+    for comment in comments[-3:]:  # Показываем последние 3 комментария
+        comment_text = clean_html_content(comment.get('content', ''))
+        comment_author = get_user_name(session_token, comment.get('users_id')) or 'Аноним'
+        comment_date = comment.get('date_creation', '')
+        
+        message_lines.append(
+            f"<b>Автор:</b> {comment_author}\n<b>Дата: </b>{comment_date}\n\n"
+            f"{comment_text[:200]}{'...' if len(comment_text) > 200 else ''}"
+        )
+    
+    try:
+        await bot.send_message(
+            user_id,
+            "\n".join(message_lines),
+            disable_web_page_preview=True,
+            parse_mode=ParseMode.HTML  
+        )
+    except Exception as e:
+        print(f"Ошибка отправки уведомления о комментариях пользователю {user_id}: {str(e)}")
+
+async def send_combined_notification(
+    bot: Bot,
+    ticket_id: int,
+    ticket_name: str,
+    changes: dict,
+    comments: list,
+    user_id: int,
+    session_token: str
+):
+    """Отправляет комбинированное уведомление об изменениях и комментариях"""
+    message_lines = [
+        f"📢 Изменения и комментарии в заявке #{ticket_id}",
+        f"📌 Тема: {ticket_name}",
+        "",
+        "Измененные параметры:"
+    ]
+    
+    for field, (field_name, prev_val, curr_val) in changes.items():
+        message_lines.append(f"{field_name}:")
+        message_lines.append(f"Было: {prev_val}")
+        message_lines.append(f"Стало: {curr_val}")
+        message_lines.append("")
+    
+    message_lines.extend([
+        "",
+        "Новые комментарии:"
+    ])
+    
+    for comment in comments[-2:]:  # Показываем последние 2 комментария
+        comment_text = clean_html_content(comment.get('content', ''))
+        comment_author = get_user_name(session_token, comment.get('users_id')) or 'Аноним'
+        comment_date = comment.get('date_creation', '')
+        
+        message_lines.append(
+            f"<b>Автор:</b> {comment_author}\n<b>Дата: </b>{comment_date}\n\n"
+            f"{comment_text[:200]}{'...' if len(comment_text) > 200 else ''}"
+        )
+        
+    message_lines.append(f"\n📅 Последнее изменение: {datetime.now().strftime('%Y-%m-%d %H:%M')}")
+    
+    try:
+        await bot.send_message(
+            user_id,
+            "\n".join(message_lines),
+            disable_web_page_preview=True,
+            parse_mode=ParseMode.HTML  
+        )
+    except Exception as e:
+        print(f"Ошибка отправки комбинированного уведомления пользователю {user_id}: {str(e)}")
+
+def get_user_name(session_token: str, user_id: int) -> Optional[str]:
+    if not user_id or not session_token:
+        return None
+    
+    url = f"{GLPI_URL}/User/{user_id}"
+    headers = {
+        "Content-Type": "application/json",
+        "App-Token": GLPI_API_KEY,
+        "Session-Token": session_token
+    }
+    
+    try:
+        response = requests.get(url, headers=headers)
+        if response.status_code in (200, 206):
+            user_data = response.json()
+            
+            # Получаем все возможные варианты имени
+            firstname = user_data.get('firstname')
+            realname = user_data.get('realname')
+            name = user_data.get('name')
+            
+            # Формируем полное имя из firstname и realname, если они есть
+            if firstname is not None or realname is not None:
+                firstname = firstname.strip() if isinstance(firstname, str) else ''
+                realname = realname.strip() if isinstance(realname, str) else ''
+                full_name = f"{firstname} {realname}".strip()
+                if full_name:
+                    return full_name
+            
+            # Если firstname и realname None или пустые, используем name
+            if name is not None:
+                return name.strip() if isinstance(name, str) else f"Пользователь {user_id}"
+            
+            # Если ничего не найдено
+            return f"Пользователь {user_id}"
+            
+        else:
+            print(f"Ошибка получения пользователя {user_id}: {response.status_code} {response.text}")
+            return f"Пользователь {user_id}"
+    except Exception as e:
+        print(f"Исключение при получении пользователя {user_id}: {e}")
+        return f"Пользователь {user_id}"
+    
+    
 def detect_ticket_changes(previous: dict, current: dict) -> Dict[str, Tuple]:
     """Обнаруживает изменения между состояниями заявки"""
     changes = {}
     
     for field, (field_name, formatter) in TRACKED_FIELDS.items():
+       # Пропускаем комментарии, так как они обрабатываются отдельно
+        if field == 'comments':
+            continue
+            
         prev_value = previous.get(field)
         curr_value = current.get(field)
         
@@ -619,9 +876,9 @@ async def send_ticket_update_notification(
     ]
     
     for field, (field_name, prev_val, curr_val) in changes.items():
-        message_lines.append(f"▫️ {field_name}:")
-        message_lines.append(f"    Было: {prev_val}")
-        message_lines.append(f"    Стало: {curr_val}")
+        message_lines.append(f"{field_name}:")
+        message_lines.append(f"Было: {prev_val}")
+        message_lines.append(f"Стало: {curr_val}")
         message_lines.append("")
     
     message_lines.extend([
@@ -653,3 +910,4 @@ def get_ticket_details(session_token: str, ticket_id: int) -> Optional[dict]:
     except Exception as e:
         print(f"Ошибка получения деталей заявки {ticket_id}: {str(e)}")
     return None
+    
