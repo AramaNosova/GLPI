@@ -1,0 +1,7 @@
+aiogram==3.13
+python-dotenv
+pandas
+langchain
+faiss-cpu
+numpy
+sentence-transformers
