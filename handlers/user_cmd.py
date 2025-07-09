@@ -56,6 +56,8 @@ from sentence_transformers import SentenceTransformer
 # Инициализация модели для эмбеддингов
 model = SentenceTransformer('paraphrase-multilingual-MiniLM-L12-v2')
 
+
+
 # Векторная база данных категорий
 CATEGORIES = {
     "Авторизация": {
